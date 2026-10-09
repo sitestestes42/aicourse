@@ -5,6 +5,7 @@
   /* ------------------------------------------------------------ helpers */
   var PASS = (window.AWL_CONFIG && AWL_CONFIG.PASS_MARK) || 70;
   var root = document.getElementById("main");
+  var activePlayer = null; /* the lesson video player currently on screen, so it can be cleaned up on navigation */
 
   function h(tag, attrs) {
     var e = document.createElement(tag);
@@ -51,7 +52,8 @@
   S.log = S.log || [];
   S.miniBrief = S.miniBrief || null;
   S.tools = S.tools || {};
-  S.certDate = S.certDate || null;
+  S.video = S.video || {}; /* per-lesson video position: { pos, dur, rate, watched } */
+  delete S.certDate; /* legacy field from the removed certificate feature */
   function save() { try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) {} }
   function log(t) { S.log.unshift({ t: t, d: Date.now() }); S.log = S.log.slice(0, 12); }
   function toast(title, sub) {
@@ -453,14 +455,23 @@
       h("span", { class: "pill live" }, "Module " + M.n),
       h("span", { class: "pill" }, "≈ " + L.time + " min"),
       h("span", { class: "pill" }, "Lesson " + (COURSE[M.id].lessons.indexOf(L) + 1) + " of " + COURSE[M.id].lessons.length),
-      st.done ? h("span", { class: "pill done" }, "Completed") : null));
+      st.done ? h("span", { class: "pill done" }, "Completed") : null,
+      (S.video[id] && S.video[id].watched) ? h("span", { class: "pill" }, "Video watched") : null));
     page.appendChild(h("p", { class: "objective" }, h("strong", {}, "Learning objective. "), L.objective));
 
-    /* video + script */
+    /* video + transcript */
+    var vcfg = (window.LESSON_VIDEOS && LESSON_VIDEOS[id]) || {};
     var paras = L.script.split(/\n\n+/).map(function (p) { return h("p", {}, p); });
+    var player = window.AWLPlayer ? AWLPlayer.create({
+      title: L.title, description: L.objective, config: vcfg, saved: S.video[id],
+      onSave: function (v) { S.video[id] = v; save(); }
+    }) : null;
+    activePlayer = player;
     page.appendChild(h("div", { class: "section" },
-      h("div", { class: "videobox" }, h("div", { class: "play", "aria-hidden": "true" }, "▶"), h("div", {}, h("strong", {}, "Video lesson"), h("small", {}, "Instructor script · about " + L.time + " minutes. Read it here, or record it with the same words."))),
-      h("details", { class: "script", open: true }, h("summary", {}, h("span", {}, "Full video script"), h("span", { "aria-hidden": "true" }, "▾")), h("div", { class: "t" }, paras))));
+      player ? player.el : null,
+      h("details", { class: "script", open: !(player && player.kind !== "none" && player.kind !== "invalid") },
+        h("summary", {}, h("span", {}, "Lesson transcript (instructor script)"), h("span", { "aria-hidden": "true" }, "▾")),
+        h("div", { class: "t" }, paras))));
 
     page.appendChild(section("Intro", "Introduction", h("div", { class: "prose" }, h("p", {}, L.intro))));
     page.appendChild(section("Explain", "Main explanation", h("div", { class: "prose", html: L.explain.join("") })));
@@ -532,7 +543,13 @@
       toast("Lesson complete", nextL ? "Continuing to the next lesson" : "Back to the module");
       setTimeout(function () { location.hash = go; }, 900);
     }
-    page.appendChild(h("div", { class: "complete" }, h("div", { class: "reqs" }, rA, rQ, rP), cBtnDone));
+    var bar = h("div", { class: "complete" }, h("div", { class: "reqs" }, rA, rQ, rP), cBtnDone);
+    page.appendChild(bar);
+    /* keep the sticky completion bar from covering the video controls while the video is on screen */
+    if (player && window.IntersectionObserver) {
+      var io = new IntersectionObserver(function (entries) { bar.classList.toggle("is-hidden", entries[entries.length - 1].isIntersecting); });
+      setTimeout(function () { if (player.el.isConnected) io.observe(player.el); }, 0); /* observe after the page is attached */
+    }
     refreshComplete();
     return page;
   }
@@ -546,7 +563,7 @@
       var inp = h("input", { type: "text", id: "nm", placeholder: "Your name", "aria-label": "Your name", maxlength: "60" });
       var form = h("form", { class: "card", style: "margin-bottom:20px", onsubmit: function (e) { e.preventDefault(); if (inp.value.trim()) { S.name = inp.value.trim(); save(); route(); } } },
         h("strong", {}, "Welcome. What should we call you?"), h("div", { style: "display:flex;gap:10px;margin-top:10px;flex-wrap:wrap" }, h("div", { style: "flex:1;min-width:200px" }, inp), h("button", { class: "btn btn-primary", type: "submit" }, "Save name")),
-        h("small", { style: "color:var(--ink-3)" }, "Your name appears on your certificate. Everything is stored in this browser."));
+        h("small", { style: "color:var(--ink-3)" }, "Everything is stored in this browser."));
       p.appendChild(form);
     }
     var nl = nextLesson();
@@ -766,41 +783,12 @@
     return wrap;
   }
 
-  /* ------------------------------------------------------------ certificate */
-  function hash(s) { var x = 5381; for (var i = 0; i < s.length; i++) x = ((x << 5) + x + s.charCodeAt(i)) >>> 0; return x.toString(36).toUpperCase().padStart(7, "0"); }
-  function renderCertificate() {
-    var allQuizzes = LIVE.every(function (m) { return !COURSE[m.id].quiz || (quizState("m:" + m.id) && quizState("m:" + m.id).passed); });
-    var reqs = [
-      ["90% or more of the course completed (" + coursePct() + "% now)", coursePct() >= 90],
-      ["All module quizzes passed", allQuizzes && LIVE.length === CURRICULUM.length],
-      ["NOVA production project completed (Module 10)", !!S.awarded["proj:nova"]],
-      ["100-point website audit completed (Module 11)", !!S.awarded["audit"]],
-      ["Capstone project completed (Module 12)", !!S.awarded["capstone"]]
-    ];
-    var eligible = reqs.every(function (r) { return r[1]; });
-    var p = h("div", {}, h("h1", {}, "Certificate"), h("p", { style: "color:var(--ink-2)" }, "Your certificate unlocks when every requirement below is met."));
-    var ul = h("ul", { class: "reqlist card" }); reqs.forEach(function (r) { ul.appendChild(h("li", { class: r[1] ? "ok" : "" }, r[0])); });
-    p.appendChild(ul);
-    var name = S.name || "Student Name";
-    var date = eligible ? (S.certDate = S.certDate || new Date().toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" })) : "Completion date";
-    var cert = h("div", { class: "cert" + (eligible ? "" : " locked"), style: "margin-top:24px" },
-      h("span", { class: "eyebrow" }, "Certificate of completion"),
-      h("div", { class: "name" }, name),
-      h("p", {}, "has successfully completed"),
-      h("h2", {}, "AI Website Launch"),
-      h("p", {}, "Build Better Websites With AI"),
-      h("p", { style: "margin-top:26px;color:var(--ink-2)" }, "Completion date: " + date),
-      h("p", { style: "color:var(--ink-2)" }, "Certificate ID: " + (eligible ? "AWL-" + hash(name + date) : "AWL-XXXXXXX")));
-    p.appendChild(cert);
-    if (!eligible) p.appendChild(h("p", { style: "color:var(--ink-3);margin-top:10px" }, "Preview only. Complete the requirements to unlock the real certificate."));
-    else p.appendChild(h("button", { class: "btn btn-primary", style: "margin-top:16px", onclick: function () { window.print(); } }, "Print or save as PDF"));
-    return p;
-  }
-
   /* ------------------------------------------------------------ router */
   function route() {
     var parts = (location.hash || "#/dashboard").replace(/^#\//, "").split("/");
     var page = parts[0] || "dashboard", id = parts[1];
+    if (page === "certificate") { location.replace("#/dashboard"); return; } /* removed feature: old links go to the dashboard */
+    if (activePlayer) { try { activePlayer.destroy(); } catch (e) {} activePlayer = null; }
     var view;
     try {
       if (page === "dashboard") view = renderDashboard();
@@ -810,14 +798,13 @@
       else if (page === "quiz") view = renderModuleQuiz(id);
       else if (page === "tools") view = renderTools();
       else if (page === "tool") view = renderTool(id);
-      else if (page === "certificate") view = renderCertificate();
       else view = notFound();
     } catch (err) {
       console.error(err);
       view = h("div", { class: "card" }, h("h2", {}, "Something went wrong"), h("p", {}, "This page could not be displayed. Return to the dashboard and try again."), h("a", { class: "btn", href: "#/dashboard" }, "Dashboard"));
     }
     root.innerHTML = ""; root.appendChild(view);
-    var navKey = { dashboard: "dashboard", course: "course", module: "course", lesson: "course", quiz: "course", tools: "tools", tool: "tools", certificate: "certificate" }[page];
+    var navKey = { dashboard: "dashboard", course: "course", module: "course", lesson: "course", quiz: "course", tools: "tools", tool: "tools" }[page];
     Array.prototype.forEach.call(document.querySelectorAll("[data-nav]"), function (a) { if (a.getAttribute("data-nav") === navKey) a.setAttribute("aria-current", "page"); else a.removeAttribute("aria-current"); });
     window.scrollTo(0, 0); root.focus({ preventScroll: true });
     updateXP();
